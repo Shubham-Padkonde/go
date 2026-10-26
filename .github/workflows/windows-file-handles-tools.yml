@@ -1,0 +1,63 @@
+name: Go Windows tooling comparison
+on:
+  push:
+    branches: [ci/windows-file-handles-tools]
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: baseline
+            ref: fac60caabcaa72dfab63174692d2d45cb7cbf770
+          - name: fixed
+            ref: 8eebe034dd570d247106953f684e45e7c2a557ab
+    env:
+      GOMAXPROCS: '4'
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.ref }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.3'
+          cache: false
+      - name: Build source
+        shell: pwsh
+        run: |
+          $env:GOROOT_BOOTSTRAP = go env GOROOT
+          $env:PATH = "C:\mingw64\bin;C:\msys64\mingw64\bin;$env:PATH"
+          $env:GOCACHE = Join-Path $env:RUNNER_TEMP 'go-cache'
+          $env:CGO_ENABLED = '1'
+          Push-Location src
+          & .\make.bat *> ..\build.log
+          $result = $LASTEXITCODE
+          Pop-Location
+          exit $result
+      - name: Compare failures from full run
+        shell: pwsh
+        run: |
+          $env:PATH = "C:\mingw64\bin;C:\msys64\mingw64\bin;$env:PATH"
+          $env:GOCACHE = Join-Path $env:RUNNER_TEMP 'go-cache'
+          $env:CGO_ENABLED = '1'
+          & .\bin\go.exe test -short -json -run '^(TestCall|TestCallback)$' cmd/cgo/internal/swig *> swig.jsonl
+          $swig = $LASTEXITCODE
+          & .\bin\go.exe test -short -json -run '^TestScript$/(mod_tidy_compat.*|mod_tidy_diff|list_pkgconfig_error|cpu_profile_twice|embed|cover_var_init_order|doc_http_clean_cache)$' cmd/go *> command.jsonl
+          $command = $LASTEXITCODE
+          "swig=$swig command=$command" | Set-Content result.txt
+          if ($swig -ne 0 -or $command -ne 0) { exit 1 }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tools-${{ matrix.name }}
+          path: |
+            build.log
+            swig.jsonl
+            command.jsonl
+            result.txt
+          if-no-files-found: error
