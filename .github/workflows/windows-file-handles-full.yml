@@ -1,0 +1,43 @@
+name: Go full Windows validation
+on:
+  push:
+    branches: [ci/windows-file-handles-full]
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 60
+    env:
+      GOMAXPROCS: '4'
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 8eebe034dd570d247106953f684e45e7c2a557ab
+          fetch-depth: 2
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.3'
+          cache: false
+      - name: Build and run complete Go short test suite
+        shell: pwsh
+        run: |
+          $env:GOROOT_BOOTSTRAP = go env GOROOT
+          $env:PATH = "C:\mingw64\bin;C:\msys64\mingw64\bin;$env:PATH"
+          $env:GOCACHE = Join-Path $env:RUNNER_TEMP 'go-cache'
+          gcc --version
+          if ($LASTEXITCODE -ne 0) { throw 'GCC is required for cgo tests' }
+          $env:CGO_ENABLED = '1'
+          Push-Location src
+          & .\all.bat *> ..\full-windows.log
+          $result = $LASTEXITCODE
+          Pop-Location
+          Get-Content full-windows.log -Tail 60
+          exit $result
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: full-windows-results
+          path: full-windows.log
+          if-no-files-found: error
