@@ -1,0 +1,82 @@
+name: Windows file handle validation
+on:
+  push:
+    branches: [ci/windows-file-handles]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 45
+    env:
+      GOMAXPROCS: '4'
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 8eebe034dd570d247106953f684e45e7c2a557ab
+          fetch-depth: 2
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.3'
+          cache: false
+      - name: Build current source
+        shell: pwsh
+        run: |
+          $env:GOROOT_BOOTSTRAP = go env GOROOT
+          $env:GOCACHE = Join-Path $env:RUNNER_TEMP 'go-cache'
+          "GOCACHE=$env:GOCACHE" >> $env:GITHUB_ENV
+          Push-Location src
+          & .\make.bat
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Pop-Location
+      - name: Full affected package tests
+        shell: pwsh
+        run: |
+          & .\bin\go.exe test -short -json os internal/poll internal/syscall/windows > fixed.jsonl
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $events = Get-Content fixed.jsonl | ForEach-Object { $_ | ConvertFrom-Json }
+          foreach ($test in @('TestClosedStat', 'TestClosedDirectoryHandle', 'TestFileStatCloseRace')) {
+            if (-not ($events | Where-Object { $_.Test -eq $test -and $_.Action -eq 'pass' })) { throw "Missing passing regression: $test" }
+          }
+      - name: Race detection
+        shell: pwsh
+        run: |
+          $env:PATH = "C:\mingw64\bin;C:\msys64\mingw64\bin;$env:PATH"
+          gcc --version
+          if ($LASTEXITCODE -ne 0) { throw 'GCC is required for the Go race detector' }
+          $env:CGO_ENABLED = '1'
+          & .\bin\go.exe test -race -short -json os internal/poll > race.jsonl
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify regressions fail on unchanged source
+        shell: pwsh
+        run: |
+          git restore --source=fac60caabcaa72dfab63174692d2d45cb7cbf770 -- src/os/stat_windows.go src/os/dir_windows.go
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & .\bin\go.exe test -json -run '^(TestClosedStat|TestClosedDirectoryHandle|TestFileStatCloseRace)$' os > baseline.jsonl
+          if ($LASTEXITCODE -eq 0) { throw 'Regressions unexpectedly passed on unchanged source' }
+          $events = Get-Content baseline.jsonl | ForEach-Object { $_ | ConvertFrom-Json }
+          $expected = @('TestClosedStat', 'TestClosedDirectoryHandle')
+          foreach ($op in @('Stat','ReadDir','Readdir','Readdirnames')) {
+            foreach ($primed in @('false','true')) { $expected += "TestClosedDirectoryHandle/$op/primed=$primed" }
+          }
+          foreach ($test in $expected) {
+            if (-not ($events | Where-Object { $_.Test -eq $test -and $_.Action -eq 'fail' })) { throw "Missing expected regression failure: $test" }
+          }
+          git restore --source=8eebe034dd570d247106953f684e45e7c2a557ab -- src/os/stat_windows.go src/os/dir_windows.go
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Format and whitespace
+        shell: pwsh
+        run: |
+          $files = @('src/os/stat_windows.go','src/os/dir_windows.go','src/os/stat_test.go','src/os/os_windows_test.go')
+          $unformatted = & .\bin\gofmt.exe -l @files
+          if ($unformatted) { throw "Unformatted files: $unformatted" }
+          git diff --check HEAD^ HEAD
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-handle-test-results
+          path: '*.jsonl'
+          if-no-files-found: error
