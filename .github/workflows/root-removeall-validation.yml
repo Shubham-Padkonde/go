@@ -1,0 +1,150 @@
+name: Root RemoveAll path validation
+on:
+  push:
+    branches: [ci/root-removeall-path]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  unix:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    env:
+      GOMAXPROCS: '4'
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 278836762a4b6dd8e239683e140e56fa3aba9da7
+          fetch-depth: 2
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.3'
+          cache: false
+      - name: Build source
+        run: |
+          export GOROOT_BOOTSTRAP="$(go env GOROOT)"
+          unset GOROOT
+          cd src
+          ./make.bash
+      - name: Full affected package and race tests
+        run: |
+          ./bin/go test -short -json os > fixed.jsonl
+          ./bin/go test -race -short -json os > race.jsonl
+          python3 - <<'PY'
+          import json
+          for path in ['fixed.jsonl', 'race.jsonl']:
+              events = [json.loads(line) for line in open(path)]
+              passed = [e for e in events if e.get('Test', '').startswith('TestRootRemoveAllPathError/') and e['Action'] == 'pass']
+              assert len(passed) == 8, (path, passed)
+          PY
+      - name: Verify regression fails on unchanged source
+        run: |
+          git restore --source=710b4bec8084f88c3044c85c1278c9b784d12801 -- src/os/root_openat.go src/os/root_noopenat.go
+          set +e
+          ./bin/go test -json -run '^TestRootRemoveAllPathError$' os > baseline.jsonl
+          status=$?
+          set -e
+          test "$status" -ne 0
+          python3 - <<'PY'
+          import json
+          events = [json.loads(line) for line in open('baseline.jsonl')]
+          failed = [e for e in events if e.get('Test', '').startswith('TestRootRemoveAllPathError/') and e['Action'] == 'fail']
+          assert len(failed) == 8, failed
+          PY
+          git restore --source=278836762a4b6dd8e239683e140e56fa3aba9da7 -- src/os/root_openat.go src/os/root_noopenat.go
+      - name: No-openat implementation probe under Node
+        if: runner.os == 'Linux'
+        run: |
+          cat > "$RUNNER_TEMP/removeall-probe.go" <<'GO'
+          package main
+          import ("errors"; "fmt"; "os"; "path/filepath"; "strings")
+          func must(err error) { if err != nil { panic(err) } }
+          func main() {
+              dir, err := os.MkdirTemp("", "root-removeall-probe")
+              must(err)
+              defer os.RemoveAll(dir)
+              old, err := os.Getwd(); must(err)
+              must(os.Chdir(dir)); defer os.Chdir(old)
+              failures := 0
+              for _, rootName := range []string{dir, "."} {
+                  for _, name := range []string{"dir", "parent/dir", "parent/../dir", "./dir/"} {
+                      must(os.MkdirAll("parent", 0755))
+                      locked := filepath.Join(name, "locked")
+                      must(os.MkdirAll(locked, 0755))
+                      must(os.WriteFile(filepath.Join(locked, "file"), nil, 0644))
+                      must(os.Chmod(locked, 0555))
+                      root, err := os.OpenRoot(rootName); must(err)
+                      err = root.RemoveAll(name)
+                      must(root.Close())
+                      must(os.Chmod(locked, 0755))
+                      pe, ok := err.(*os.PathError)
+                      want := strings.TrimRight(name, "/") + "/locked/file"
+                      if !ok || pe.Path != want || !errors.Is(err, os.ErrPermission) {
+                          fmt.Printf("FAIL %q %q: %v, want permission error for %q\n", rootName, name, err, want)
+                          failures++
+                      } else { fmt.Printf("PASS %q %q\n", rootName, name) }
+                  }
+              }
+              if failures != 0 { os.Exit(1) }
+          }
+          GO
+          GOOS=js GOARCH=wasm ./bin/go build -o "$RUNNER_TEMP/removeall-probe.wasm" "$RUNNER_TEMP/removeall-probe.go"
+          ./lib/wasm/go_js_wasm_exec "$RUNNER_TEMP/removeall-probe.wasm" > wasm-fixed.log
+          test "$(grep -c '^PASS' wasm-fixed.log)" -eq 8
+          git restore --source=710b4bec8084f88c3044c85c1278c9b784d12801 -- src/os/root_noopenat.go
+          GOOS=js GOARCH=wasm ./bin/go build -o "$RUNNER_TEMP/removeall-probe.wasm" "$RUNNER_TEMP/removeall-probe.go"
+          set +e
+          ./lib/wasm/go_js_wasm_exec "$RUNNER_TEMP/removeall-probe.wasm" > wasm-baseline.log
+          status=$?
+          set -e
+          test "$status" -ne 0
+          test "$(grep -c '^FAIL' wasm-baseline.log)" -eq 8
+          git restore --source=278836762a4b6dd8e239683e140e56fa3aba9da7 -- src/os/root_noopenat.go
+      - name: Plan 9 compile and formatting
+        if: runner.os == 'Linux'
+        run: |
+          GOOS=plan9 GOARCH=amd64 ./bin/go test -c -o "$RUNNER_TEMP/os.plan9.test" os
+          test -z "$(./bin/gofmt -l src/os/root_openat.go src/os/root_noopenat.go src/os/root_test.go)"
+          git diff --exit-code
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: removeall-${{ runner.os }}
+          path: |
+            *.jsonl
+            wasm-*.log
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 35
+    env:
+      GOMAXPROCS: '4'
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 278836762a4b6dd8e239683e140e56fa3aba9da7
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.3'
+          cache: false
+      - name: Build and test os package
+        shell: pwsh
+        run: |
+          $env:GOROOT_BOOTSTRAP = go env GOROOT
+          Remove-Item Env:GOROOT -ErrorAction SilentlyContinue
+          Push-Location src
+          & .\make.bat
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Pop-Location
+          & .\bin\go.exe test -short -json os > fixed.jsonl
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: removeall-Windows
+          path: '*.jsonl'
